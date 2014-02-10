@@ -43,6 +43,18 @@ namespace OpenBabel
   extern OBAtomTyper      atomtyper;
   extern OBBondTyper      bondtyper;
 
+  // Constants for the ConnectTheDots bond inference algorithm
+  static const double EXTDIST  = 0.45;
+  static const double MAXRAD   = 2.50;
+  static const double MINDIST  = 0.40;
+  static const double MAXDIST  = 5.45;     // 2*MAXRAD + EXTDIST
+  static const double MINDIST2 = 0.16;     // MINDIST*MINDIST
+  static const double MAXDIST2 = 29.7025;  // MAXDIST*MAXDIST
+  static const int HASHSIZE = 1024;
+  static const int HASHMASK = 1023;
+  static const int HASHX    =  571;
+  static const int HASHY    =  127;
+  static const int HASHZ    =    3;
 
   /** \class OBMol mol.h <openbabel/mol.h>
       \brief Molecule Class
@@ -3436,13 +3448,48 @@ namespace OpenBabel
     return true;
   }
 
-  /*! This method adds single bonds between all atoms
-    closer than their combined atomic covalent radii,
-    then "cleans up" making sure bonded atoms are not
-    closer than 0.4A and the atom does not exceed its valence.
-    It implements blue-obelisk:rebondFrom3DCoordinates.
+  /*! A minimal struct to hold data relevant to ConnectTheDots.
+   *  Implementation of RDKit::ProximityEntry
+   */
+  struct ProximityEntry {
+    double x, y, z, radius;
+    int hash, next;
+    OBAtom *atom;
+  };
 
-  */
+  /*! This method is a speed-optimized distance calculator. Benefits include:
+   *    - No expensive square root calculation
+   *    - Short circuits if distance is infeasible
+   *  Implementation of RDKit::IsBonded.
+   */
+  bool IsBonded(ProximityEntry *first, ProximityEntry *second)
+  {
+    double dx = second->x - first->x;
+    double dist2 = dx * dx;
+    if (dist2 > MAXDIST2)
+      return false;
+
+    double dy = second->y - first->y;
+    dist2 += dy * dy;
+    if (dist2 > MAXDIST2)
+      return false;
+
+    double dz = second->z - first->z;
+    dist2 += dz * dz;
+    if (dist2 < MINDIST2 || dist2 > MAXDIST2)
+      return false;
+
+    double radius = first->radius + second->radius + EXTDIST;
+    //cout << radius << " " << dist2 << endl;
+    return (dist2 < radius * radius);
+  }
+
+  /*! This method adds single bonds between all atoms closer than their
+   *  combined atomic covalent radii, then runs a clean-up operation to ensure
+   *  that no valences are exceeded.
+   *  Core algorithm implemented from RDKit::ConnectTheDots_Large, clean-up
+   *  from openbabel contributors.
+   */
   void OBMol::ConnectTheDots(void)
   {
     if (Empty())
@@ -3452,144 +3499,90 @@ namespace OpenBabel
     obErrorLog.ThrowError(__FUNCTION__,
                           "Ran OpenBabel::ConnectTheDots", obAuditMsg);
 
-    int j,k,max;
-    bool unset = false;
-    OBAtom *atom,*nbr;
-    vector<OBAtom*>::iterator i;
-    vector<pair<OBAtom*,double> > zsortedAtoms;
-    vector<double> rad;
-    vector<int> zsorted;
-    vector<int> bondCount; // existing bonds (e.g., from residues in PDB)
-
-    double *c = new double [NumAtoms()*3];
-    rad.resize(_natoms);
-
-    for (j = 0, atom = BeginAtom(i) ; atom ; atom = NextAtom(i), ++j)
-      {
-        (atom->GetVector()).Get(&c[j*3]);
-        pair<OBAtom*,double> entry(atom, atom->GetVector().z());
-        zsortedAtoms.push_back(entry);
-        bondCount.push_back(atom->GetValence());
-      }
-    sort(zsortedAtoms.begin(), zsortedAtoms.end(), SortAtomZ);
-
-    max = zsortedAtoms.size();
-
-    for ( j = 0 ; j < max ; j++ )
-      {
-        atom   = zsortedAtoms[j].first;
-        rad[j] = etab.GetCovalentRad(atom->GetAtomicNum());
-        zsorted.push_back(atom->GetIdx()-1);
-      }
-
-    int idx1, idx2;
-    double d2,cutoff,zd;
-    for (j = 0 ; j < max ; ++j)
-      {
-        idx1 = zsorted[j];
-        for (k = j + 1 ; k < max ; k++ )
-          {
-            idx2 = zsorted[k];
-
-            // bonded if closer than elemental Rcov + tolerance
-            cutoff = SQUARE(rad[j] + rad[k] + 0.45);
-
-            zd  = SQUARE(c[idx1*3+2] - c[idx2*3+2]);
-            if (zd > 25.0 )
-              break; // bigger than max cutoff
-
-            d2  = SQUARE(c[idx1*3]   - c[idx2*3]);
-            d2 += SQUARE(c[idx1*3+1] - c[idx2*3+1]);
-            d2 += zd;
-
-            if (d2 > cutoff)
-              continue;
-            if (d2 < 0.40)
-              continue;
-
-            atom = GetAtom(idx1+1);
-            nbr  = GetAtom(idx2+1);
-
-            if (atom->IsConnected(nbr))
-              continue;
-            if (atom->IsHydrogen() && nbr->IsHydrogen())
-              continue;
-
-            AddBond(idx1+1,idx2+1,1);
-          }
-      }
-
-    // If between BeginModify and EndModify, coord pointers are NULL
-    // setup molecule to handle current coordinates
-
-    if (_c == NULL)
-      {
-        _c = c;
-        for (atom = BeginAtom(i);atom;atom = NextAtom(i))
-          atom->SetCoordPtr(&_c);
-        _vconf.push_back(c);
-        unset = true;
-      }
-
-    // Cleanup -- delete long bonds that exceed max valence
-    OBBond *maxbond, *bond;
-    double maxlength;
+    unsigned int numPreExistingBonds = NumBonds(), maxBonds;
+    int hash, dx, dy, dz, probe, list, i;
+    int hashTable[HASHSIZE];
+    double longestLength, length;
+    OBAtom *atom;
+    OBBond *longestBond, *bond;
     vector<OBBond*>::iterator l;
-    int valCount;
+    vector<OBAtom*>::iterator a;
+    memset(hashTable, -1, sizeof(hashTable));
+    ProximityEntry *tmp = (ProximityEntry*)malloc(NumAtoms() * sizeof(ProximityEntry));
+    ProximityEntry *tmp_i, *tmp_j;
 
-    for (atom = BeginAtom(i);atom;atom = NextAtom(i))
+    // This algorithm uses a hash to check all potential connections in
+    // amortized O(N) time, as well as an optimized distance checker.
+    for (atom = BeginAtom(a), i = 0; atom; atom = NextAtom(a), i++)
+    {
+      tmp_i = tmp + i;
+      tmp_i->x = atom->GetX();
+      tmp_i->y = atom->GetY();
+      tmp_i->z = atom->GetZ();
+      tmp_i->radius = etab.GetCovalentRad((int)(atom->GetAtomicNum()));
+      tmp_i->atom = atom;
+
+      hash = HASHX * (int)(tmp_i->x / MAXDIST) +
+             HASHY * (int)(tmp_i->y / MAXDIST) +
+             HASHZ * (int)(tmp_i->z / MAXDIST);
+
+      for (int dx = -HASHX; dx <= HASHX; dx += HASHX)
       {
-        while (atom->BOSum() > static_cast<unsigned int>(etab.GetMaxBonds(atom->GetAtomicNum()))
-               || atom->SmallestBondAngle() < 45.0)
+        for (int dy = -HASHY; dy <= HASHY; dy += HASHY)
+        {
+          for (int dz = -HASHZ; dz <= HASHZ; dz += HASHZ)
           {
-            bond = atom->BeginBond(l);
-            maxbond = bond;
-            // Fix from Liu Zhiguo 2008-01-26
-            // loop past any bonds
-            // which existed before ConnectTheDots was called
-            // (e.g., from PDB resdata.txt)
-            valCount = 0;
-            while (valCount < bondCount[atom->GetIdx() - 1]) {
-              bond = atom->NextBond(l);
-              // timvdm: 2008-03-05
-              // NextBond only returns NULL if the iterator l == _bonds.end().
-              // This was casuing problems as follows:
-              // NextBond = 0x????????
-              // NextBond = 0x????????
-              // NextBond = 0x????????
-              // NextBond = 0x????????
-              // NextBond = NULL  <-- this NULL was not detected
-              // NextBond = 0x????????
-              if (!bond) // so we add an additional check
-                break;
-              maxbond = bond;
-              valCount++;
-            }
-            if (!bond) // no new bonds added for this atom, just skip it
-              break;
-
-            maxlength = maxbond->GetLength();
-            for (bond = atom->NextBond(l);bond;bond = atom->NextBond(l))
+            probe = hash + dx + dy + dz;
+            list = hashTable[probe & HASHMASK];
+            while (list != -1)
+            {
+              tmp_j = &tmp[list];
+              if (tmp_j->hash == probe && IsBonded(tmp_i, tmp_j) &&
+                  !((tmp_i->atom)->IsConnected(tmp_j->atom)))
               {
-                if (bond->GetLength() > maxlength)
-                  {
-                    maxbond = bond;
-                    maxlength = bond->GetLength();
-                  }
+                AddBond((tmp_i->atom)->GetIdx(), (tmp_j->atom)->GetIdx(), 1);
               }
-            DeleteBond(maxbond); // delete the new bond with the longest length
+              list = tmp_j->next;
+            }
           }
+        }
       }
 
-    if (unset)
+      list = hash & HASHMASK;
+      tmp_i->next = hashTable[list];
+      hashTable[list] = i;
+      tmp_i->hash = hash;
+    }
+    free(tmp);
+
+    // Clean-up operation: delete bonds that exceed max valence, longest first
+    for (atom = BeginAtom(a); atom; atom = NextAtom(a))
+    {
+      maxBonds = static_cast<unsigned int>(etab.GetMaxBonds(atom->GetAtomicNum()));
+
+      while (atom->BOSum() > maxBonds || atom->SmallestBondAngle() < 45.0)
       {
-        _c = NULL;
-        for (atom = BeginAtom(i);atom;atom = NextAtom(i))
-          atom->ClearCoordPtr();
-        _vconf.resize(_vconf.size()-1);
-      }
+        // Find the bond with the largest distance and delete it
+        longestBond = NULL;
+        longestLength = 0;
+        for (bond = atom->BeginBond(l); bond; bond = atom->NextBond(l))
+        {
+          // Skip bonds that existed before ConnectTheDots was called
+          // From comments by Liu Zhigou and timvdm (2008)
+          if (bond->GetIdx() < numPreExistingBonds)
+            continue;
 
-    delete [] c;
+          length = bond->GetLength();
+          if (length > longestLength)
+          {
+            longestBond = bond;
+            longestLength = length;
+          }
+        }
+        if (longestBond)
+          DeleteBond(longestBond);
+      }
+    }
   }
 
   /*! This method uses bond angles and geometries from current
